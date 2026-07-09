@@ -1,33 +1,42 @@
 /**
  * HTTP Custom SSH Tunneling Server
  *
- * Mode Replit  : SSH 127.0.0.1:2222 → bore.pub tunnel
- * Mode Railway : SSH 0.0.0.0:2222   → Railway TCP Proxy (domain statis)
+ * Mode Replit  : SSH 127.0.0.1:2222 → bore.pub tunnel (start.sh)
+ * Mode Render  : SSH 0.0.0.0:2222   → bore.pub tunnel (server.js langsung)
+ *                HTTP health  → 0.0.0.0:PORT (wajib untuk Render)
  *
  * Fitur:
- * - SSH server (ssh2) dengan password auth custom (no system users)
- * - Direct TCP forwarding (tcpip) → forward traffic internet dari HP
- * - Raw TCP proxy (port 8080) → untuk mode payload HTTP Custom
+ * - SSH server (ssh2) password auth custom (no system users)
+ * - Direct TCP forwarding → internet proxy dari HP
+ * - Raw TCP proxy port 8080 → mode payload HTTP Custom
+ * - Health endpoint → keep-alive untuk Render free tier
  */
 
 const net    = require('net');
+const http   = require('http');
 const fs     = require('fs');
 const crypto = require('crypto');
 const { Server: SSHServer } = require('ssh2');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 
-// ── Deteksi environment ───────────────────────────────────────────────────────
+// ── Environment ───────────────────────────────────────────────────────────────
+const IS_RENDER  = !!process.env.RENDER;
 const IS_RAILWAY = !!process.env.RAILWAY_ENVIRONMENT;
+const IS_CLOUD   = IS_RENDER || IS_RAILWAY;
 
-const SSH_PORT   = parseInt(process.env.SSH_PORT   || '2222', 10);
-const PROXY_PORT = parseInt(process.env.PROXY_PORT || '8080', 10);
-const SSH_BIND   = IS_RAILWAY ? '0.0.0.0' : '127.0.0.1';
+const SSH_PORT    = parseInt(process.env.SSH_PORT   || '2222', 10);
+const PROXY_PORT  = parseInt(process.env.PROXY_PORT || '8080', 10);
+const HEALTH_PORT = parseInt(process.env.PORT       || '3000', 10);
+const SSH_BIND    = IS_CLOUD ? '0.0.0.0' : '127.0.0.1';
 
 const SSH_USER    = process.env.SSH_USER || 'admin';
 const SSH_PASS    = process.env.SSH_PASS || 'changeme';
 const PROXY_TOKEN = process.env.PROXY_TOKEN || '';
+const BORE_PORT   = process.env.BORE_PORT || '0';  // 0 = acak, angka = statis
 
-console.log(`[*] Mode           → ${IS_RAILWAY ? 'Railway' : 'Replit'}`);
+const mode = IS_RENDER ? 'Render' : IS_RAILWAY ? 'Railway' : 'Replit';
+console.log(`[*] Mode           → ${mode}`);
+console.log(`[*] SSH_USER       → ${SSH_USER}`);
 
 // ── Host key ──────────────────────────────────────────────────────────────────
 const HOST_KEY_PATH = '/tmp/ssh_host_key.pem';
@@ -47,7 +56,6 @@ if (fs.existsSync(HOST_KEY_PATH)) {
 // ── SSH Server ────────────────────────────────────────────────────────────────
 const sshServer = new SSHServer({
   hostKeys: [hostKey],
-  // Dukung algoritma lama (ssh2js yang dipakai HTTP Custom)
   algorithms: {
     kex: [
       'curve25519-sha256', 'curve25519-sha256@libssh.org',
@@ -83,25 +91,20 @@ const sshServer = new SSHServer({
       return ctx.accept();
     }
     if (ctx.method === 'none') return ctx.reject(['password']);
-    console.warn(`[SSH] Auth GAGAL: ${ctx.username} / method=${ctx.method}`);
+    console.warn(`[SSH] Auth GAGAL: ${ctx.username} method=${ctx.method}`);
     ctx.reject();
   });
 
   client.on('ready', () => {
-
-    // ── Direct TCP forwarding (SOCKS proxy / internet forwarding) ─────────
-    // Setiap request dari HP (browser, app) diteruskan ke internet via sini.
+    // ── Direct TCP forwarding — internet proxy ────────────────────────────
     client.on('tcpip', (accept, reject, info) => {
       const { destAddr, destPort } = info;
       console.log(`[FWD] → ${destAddr}:${destPort}`);
-
       const dest = net.createConnection(destPort, destAddr);
-
       dest.on('error', (err) => {
-        console.warn(`[FWD] Error → ${destAddr}:${destPort} : ${err.message}`);
+        console.warn(`[FWD] Error ${destAddr}:${destPort}: ${err.message}`);
         try { reject(); } catch (_) {}
       });
-
       dest.on('connect', () => {
         const stream = accept();
         if (!stream) { dest.destroy(); return; }
@@ -117,7 +120,7 @@ const sshServer = new SSHServer({
     // ── Shell session ─────────────────────────────────────────────────────
     client.on('session', (accept) => {
       const session = accept();
-      session.on('pty', (accept) => accept && accept());
+      session.on('pty', (a) => a && a());
       session.on('shell', (accept) => {
         const stream = accept();
         const shell  = spawn('/bin/bash', ['--login'], {
@@ -151,54 +154,113 @@ sshServer.listen(SSH_PORT, SSH_BIND, () => {
 });
 
 // ── Raw TCP Proxy (port 8080) ─────────────────────────────────────────────────
-// Untuk mode payload HTTP Custom: terima HTTP payload → balas 200 OK → pipe SSH
 const proxyServer = net.createServer((clientSock) => {
   const ip = clientSock.remoteAddress;
-  let headerBuf  = Buffer.alloc(0);
-  let headerDone = false;
-  let sshSock;
-
+  let headerBuf = Buffer.alloc(0), headerDone = false, sshSock;
   clientSock.on('data', (chunk) => {
-    if (headerDone) {
-      if (sshSock && !sshSock.destroyed) sshSock.write(chunk);
-      return;
-    }
-
+    if (headerDone) { if (sshSock && !sshSock.destroyed) sshSock.write(chunk); return; }
     headerBuf = Buffer.concat([headerBuf, chunk]);
-    const headerEnd = headerBuf.indexOf('\r\n\r\n');
-    if (headerEnd === -1) return;
-
-    const headerStr = headerBuf.slice(0, headerEnd).toString();
-    const bodyPart  = headerBuf.slice(headerEnd + 4);
-
-    const xToken    = (headerStr.match(/X-Token:\s*(\S+)/i)              || [])[1] || '';
-    const authMatch = (headerStr.match(/Authorization:\s*Bearer\s+(\S+)/i) || [])[1] || '';
-    const token     = xToken || authMatch;
-
-    if (PROXY_TOKEN && token !== PROXY_TOKEN) {
-      console.warn(`[Proxy] Token invalid dari ${ip}`);
+    const end = headerBuf.indexOf('\r\n\r\n');
+    if (end === -1) return;
+    const hdr  = headerBuf.slice(0, end).toString();
+    const body = headerBuf.slice(end + 4);
+    const tok  = ((hdr.match(/X-Token:\s*(\S+)/i)              || [])[1]) ||
+                 ((hdr.match(/Authorization:\s*Bearer\s+(\S+)/i) || [])[1]) || '';
+    if (PROXY_TOKEN && tok !== PROXY_TOKEN) {
       clientSock.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-      clientSock.destroy();
-      return;
+      clientSock.destroy(); return;
     }
-
     headerDone = true;
-    console.log(`[Proxy] Koneksi dari ${ip} → SSH`);
-
+    console.log(`[Proxy] ${ip} → SSH`);
     sshSock = net.createConnection({ host: '127.0.0.1', port: SSH_PORT });
     sshSock.on('connect', () => {
       clientSock.write('HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n');
-      if (bodyPart.length > 0) sshSock.write(bodyPart);
+      if (body.length) sshSock.write(body);
     });
     sshSock.on('data',  (d) => { if (!clientSock.destroyed) clientSock.write(d); });
     sshSock.on('close', ()  => clientSock.destroy());
-    sshSock.on('error', (e) => { console.error(`[Proxy] SSH err: ${e.message}`); clientSock.destroy(); });
+    sshSock.on('error', (e) => { console.error(`[Proxy] SSHErr: ${e.message}`); clientSock.destroy(); });
   });
-
   clientSock.on('close', () => { if (sshSock) sshSock.destroy(); });
-  clientSock.on('error', (e) => { console.error(`[Proxy] Client err ${ip}: ${e.message}`); if (sshSock) sshSock.destroy(); });
+  clientSock.on('error', (e) => { if (sshSock) sshSock.destroy(); });
 });
+proxyServer.listen(PROXY_PORT, '0.0.0.0', () =>
+  console.log(`[*] TCP Proxy      → 0.0.0.0:${PROXY_PORT}`)
+);
 
-proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {
-  console.log(`[*] TCP Proxy      → 0.0.0.0:${PROXY_PORT}`);
+// ── Health / Status HTTP server (wajib untuk Render) ─────────────────────────
+// Render butuh response di PORT, juga dipakai UptimeRobot untuk keep-alive.
+let boreAddr = 'pending...';
+
+const healthServer = http.createServer((req, res) => {
+  if (req.url === '/health' || req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      mode,
+      ssh: `${SSH_USER}@bore.pub (see /config)`,
+      bore: boreAddr,
+      uptime: Math.floor(process.uptime()) + 's',
+    }));
+  } else if (req.url === '/config') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end([
+      '=== HTTP Custom Config ===',
+      '',
+      `SSH  : ${boreAddr}@${SSH_USER}:${SSH_PASS}`,
+      '',
+      'Use Payload : NO',
+      'Enable DNS  : YES',
+      'Enhanced    : NO',
+    ].join('\n'));
+  } else {
+    res.writeHead(404); res.end('not found');
+  }
 });
+healthServer.listen(HEALTH_PORT, '0.0.0.0', () =>
+  console.log(`[*] Health Server  → 0.0.0.0:${HEALTH_PORT}`)
+);
+
+// ── Bore tunnel (Cloud mode) ──────────────────────────────────────────────────
+// Di Replit, bore dijalankan oleh start.sh.
+// Di Render/Railway, server.js jalankan bore sendiri.
+if (IS_CLOUD) {
+  console.log(`[*] Memulai bore tunnel (port request: ${BORE_PORT})...`);
+
+  // Tunggu SSH server siap dulu
+  const waitSSH = (cb, tries = 0) => {
+    const s = net.createConnection(SSH_PORT, '127.0.0.1');
+    s.on('connect', () => { s.destroy(); cb(); });
+    s.on('error',   () => {
+      if (tries > 20) { console.error('[!] SSH tidak kunjung siap'); return; }
+      setTimeout(() => waitSSH(cb, tries + 1), 500);
+    });
+  };
+
+  waitSSH(() => {
+    const bore = spawn('bore', ['local', String(SSH_PORT), '--to', 'bore.pub', '--port', BORE_PORT], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const onData = (data) => {
+      const txt = data.toString();
+      process.stdout.write('[bore] ' + txt);
+      const m = txt.match(/listening at bore\.pub:(\d+)/);
+      if (m) {
+        boreAddr = `bore.pub:${m[1]}`;
+        console.log('\n╔══════════════════════════════════════╗');
+        console.log(`║  ✅ SSH SIAP                          ║`);
+        console.log(`║  bore.pub:${m[1]}@${SSH_USER}:${SSH_PASS}`);
+        console.log('╚══════════════════════════════════════╝');
+        console.log(`[*] Config: https://<render-url>/config`);
+      }
+    };
+
+    bore.stdout.on('data', onData);
+    bore.stderr.on('data', onData);
+    bore.on('exit', (code) => {
+      console.error(`[!] bore exit code ${code} — restart dalam 5 detik...`);
+      setTimeout(() => waitSSH(() => {}), 5000);
+    });
+  });
+}

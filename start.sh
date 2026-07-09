@@ -5,15 +5,15 @@ echo "========================================"
 echo "  HTTP Custom SSH Server Setup"
 echo "========================================"
 
-# ── 1. Generate credentials acak ────────────
+# ── 1. Generate credentials ─────────────────
 SSH_USER="admin"
 SSH_PASS=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 12)
 
-export SSH_USER SSH_PASS PROXY_TOKEN=""   # token tidak dipakai (bore = raw TCP)
+export SSH_USER SSH_PASS PROXY_TOKEN=""
 
 echo "[+] Credentials di-generate."
 
-# ── 2. Jalankan server.js (SSH server) ──────
+# ── 2. Jalankan server.js ───────────────────
 echo "[*] Menjalankan SSH server..."
 pkill -f "node server.js" 2>/dev/null || true
 sleep 1
@@ -36,20 +36,21 @@ done
 echo "[+] Port 2222 (SSH) siap."
 
 # ── 3. Bore Tunnel (raw TCP) ─────────────────
-echo "[*] Membuka bore tunnel ke bore.pub..."
+BORE_PORT_REQ="${BORE_PORT:-0}"   # 0 = acak, angka = minta port spesifik
+echo "[*] Membuka bore tunnel ke bore.pub (port request: $BORE_PORT_REQ)..."
 rm -f /tmp/bore.log
-bore local 2222 --to bore.pub 2>&1 | tee /tmp/bore.log &
+bore local 2222 --to bore.pub --port "$BORE_PORT_REQ" 2>&1 | tee /tmp/bore.log &
 BORE_PID=$!
 
 # Tunggu bore port muncul (max 30 detik)
-BORE_PORT=""
+BORE_PORT_ACTUAL=""
 for i in $(seq 1 30); do
   sleep 1
-  BORE_PORT=$(grep -oP 'listening at bore\.pub:\K[0-9]+' /tmp/bore.log 2>/dev/null | head -1)
-  [ -n "$BORE_PORT" ] && break
+  BORE_PORT_ACTUAL=$(grep -oP 'listening at bore\.pub:\K[0-9]+' /tmp/bore.log 2>/dev/null | head -1)
+  [ -n "$BORE_PORT_ACTUAL" ] && break
 done
 
-if [ -z "$BORE_PORT" ]; then
+if [ -z "$BORE_PORT_ACTUAL" ]; then
   echo "[!] bore port tidak terdeteksi. Log:"
   cat /tmp/bore.log 2>/dev/null
   exit 1
@@ -60,14 +61,14 @@ echo "========================================"
 echo "  ✅ SERVER SIAP!"
 echo "========================================"
 echo ""
-echo "  📡 Tunnel : bore.pub:$BORE_PORT"
+echo "  📡 Tunnel : bore.pub:$BORE_PORT_ACTUAL"
 echo ""
 echo "════════════════════════════════════════"
 echo "  CONFIG HTTP CUSTOM (SSH LANGSUNG)"
 echo "════════════════════════════════════════"
 echo ""
 echo "  ┌─ Kolom SSH ──────────────────────────"
-echo "  bore.pub:$BORE_PORT@$SSH_USER:$SSH_PASS"
+echo "  bore.pub:$BORE_PORT_ACTUAL@$SSH_USER:$SSH_PASS"
 echo "  └──────────────────────────────────────"
 echo ""
 echo "  ❌ Use Payload  → jangan centang"
@@ -77,7 +78,11 @@ echo "  ❌ SlowDns / UDP Custom / SSL / Psiphon / V2ray"
 echo ""
 echo "  (Koneksi langsung, tidak butuh payload!)"
 echo ""
-echo "  ⚠️  Port & password BERUBAH setiap restart!"
+if [ "$BORE_PORT_REQ" != "0" ] && [ "$BORE_PORT_ACTUAL" = "$BORE_PORT_REQ" ]; then
+  echo "  ✅ Port statis berhasil: bore.pub:$BORE_PORT_ACTUAL"
+else
+  echo "  ⚠️  Port & password BERUBAH setiap restart!"
+fi
 echo "========================================"
 echo ""
 echo "[*] Tekan Ctrl+C untuk stop."

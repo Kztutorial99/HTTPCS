@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: httpcs
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: SSH_USER
+        value: admin
+      - key: SSH_PASS
+        generateValue: true
+      - key: BORE_PORT
+        value: "28222"
+      - key: NODE_ENV
+        value: production
