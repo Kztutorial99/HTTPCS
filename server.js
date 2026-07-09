@@ -1,38 +1,33 @@
 /**
- * SSH Server (ssh2) + WebSocket Proxy
- * - SSH server port 2222 dengan password auth custom (tidak perlu system user)
- * - WebSocket server port 8080 → proxy ke SSH 2222
- * - Proxy token wajib di Authorization header
+ * HTTP Custom SSH Server
+ * - SSH server (ssh2) port 2222 — password auth, no system user
+ * - Raw TCP proxy port 8080:
+ *     1. Terima HTTP payload dari HTTP Custom
+ *     2. Validasi Bearer token
+ *     3. Balas 200 OK
+ *     4. Pipe raw TCP → SSH 2222
  */
 
-const { Server: SSHServer } = require('ssh2');
-const http = require('http');
-const net = require('net');
-const WebSocket = require('ws');
-const { execFile, spawn } = require('child_process');
+const net    = require('net');
+const fs     = require('fs');
 const crypto = require('crypto');
-const fs = require('fs');
+const { Server: SSHServer } = require('ssh2');
+const { spawn } = require('child_process');
 
-const SSH_PORT  = 2222;
+const SSH_PORT   = 2222;
 const PROXY_PORT = 8080;
 
-// Credentials & token dari environment (di-set oleh start.sh)
 const SSH_USER    = process.env.SSH_USER    || 'admin';
 const SSH_PASS    = process.env.SSH_PASS    || 'changeme';
 const PROXY_TOKEN = process.env.PROXY_TOKEN || '';
 
-if (!PROXY_TOKEN) {
-  console.error('[!] PROXY_TOKEN tidak di-set — semua koneksi WS akan ditolak.');
-}
-
-// ── Generate / load host key ──────────────────────────────────────────────────
+// ── Host key ──────────────────────────────────────────────────────────────────
 const HOST_KEY_PATH = '/tmp/ssh_host_key.pem';
 let hostKey;
 if (fs.existsSync(HOST_KEY_PATH)) {
   hostKey = fs.readFileSync(HOST_KEY_PATH);
 } else {
-  // Generate RSA host key pakai Node.js crypto (format PKCS1 PEM — didukung ssh2)
-  const { generateKeyPairSync } = require('crypto');
+  const { generateKeyPairSync } = crypto;
   const { privateKey } = generateKeyPairSync('rsa', {
     modulusLength: 2048,
     privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
@@ -42,125 +37,129 @@ if (fs.existsSync(HOST_KEY_PATH)) {
 }
 
 // ── SSH Server ────────────────────────────────────────────────────────────────
-const sshServer = new SSHServer({
-  hostKeys: [hostKey],
-  banner: 'HTTP Custom SSH Server - Replit\n',
-}, (client) => {
-  const clientAddr = client._sock?.remoteAddress || 'unknown';
-  console.log(`[SSH] Klien terhubung: ${clientAddr}`);
+const sshServer = new SSHServer({ hostKeys: [hostKey] }, (client) => {
+  const addr = client._sock?.remoteAddress || '?';
+  console.log(`[SSH] Klien: ${addr}`);
 
   client.on('authentication', (ctx) => {
     if (ctx.method === 'password'
         && ctx.username === SSH_USER
         && ctx.password === SSH_PASS) {
-      console.log(`[SSH] Auth berhasil: ${ctx.username}`);
-      ctx.accept();
-    } else if (ctx.method === 'none') {
-      ctx.reject(['password']);
-    } else {
-      console.warn(`[SSH] Auth gagal — user: ${ctx.username}, method: ${ctx.method}`);
-      ctx.reject();
+      console.log(`[SSH] Auth OK: ${ctx.username}`);
+      return ctx.accept();
     }
+    if (ctx.method === 'none') return ctx.reject(['password']);
+    console.warn(`[SSH] Auth GAGAL: ${ctx.username}/${ctx.method}`);
+    ctx.reject();
   });
 
   client.on('ready', () => {
     client.on('session', (accept) => {
       const session = accept();
-
       session.on('pty', (accept) => accept && accept());
-
       session.on('shell', (accept) => {
         const stream = accept();
-        // Spawn bash shell
-        const shell = spawn('/bin/bash', ['--login'], {
-          env: { ...process.env, TERM: 'xterm-256color', HOME: process.env.HOME || '/home/runner' },
+        const shell  = spawn('/bin/bash', ['--login'], {
+          env: { ...process.env, TERM: 'xterm-256color' },
         });
-
         stream.pipe(shell.stdin);
         shell.stdout.pipe(stream);
         shell.stderr.pipe(stream.stderr);
-
-        shell.on('exit', (code) => {
-          stream.exit(code || 0);
-          stream.end();
-        });
-
+        shell.on('exit', (c) => { stream.exit(c || 0); stream.end(); });
         stream.on('close', () => shell.kill());
       });
-
-      session.on('exec', (accept, reject, info) => {
+      session.on('exec', (accept, _rej, info) => {
         const stream = accept();
-        const parts = info.command.split(' ');
-        const proc = spawn(parts[0], parts.slice(1), { env: process.env });
+        const [cmd, ...args] = info.command.split(' ');
+        const proc = spawn(cmd, args, { env: process.env });
         proc.stdout.pipe(stream);
         proc.stderr.pipe(stream.stderr);
-        proc.on('exit', (code) => { stream.exit(code || 0); stream.end(); });
+        proc.on('exit', (c) => { stream.exit(c || 0); stream.end(); });
         stream.on('close', () => proc.kill());
       });
     });
   });
 
-  client.on('error', (err) => {
-    console.error(`[SSH] Error dari ${clientAddr}: ${err.message}`);
-  });
-
-  client.on('end', () => {
-    console.log(`[SSH] Klien disconnect: ${clientAddr}`);
-  });
+  client.on('error', (e) => console.error(`[SSH] Error: ${e.message}`));
+  client.on('end',   ()  => console.log(`[SSH] Disconnect: ${addr}`));
 });
 
 sshServer.listen(SSH_PORT, '127.0.0.1', () => {
-  console.log(`[*] SSH Server berjalan di 127.0.0.1:${SSH_PORT}`);
-  console.log(`[*] User: ${SSH_USER} | Pass: ${SSH_PASS}`);
+  console.log(`[*] SSH Server     → 127.0.0.1:${SSH_PORT}`);
+  console.log(`[*] Credentials    → ${SSH_USER} / ${SSH_PASS}`);
 });
 
-// ── HTTP + WebSocket Proxy ────────────────────────────────────────────────────
-const httpServer = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('OK');
-});
+// ── Raw TCP Proxy ─────────────────────────────────────────────────────────────
+//
+// HTTP Custom mengirim payload HTTP, lalu langsung kirim traffic SSH di
+// koneksi yang sama. Kita cukup:
+//   1. Baca header HTTP
+//   2. Validasi Bearer token
+//   3. Balas 200 OK\r\n\r\n
+//   4. Pipe sisa bytes → SSH
+//
+const proxyServer = net.createServer((clientSock) => {
+  const ip = clientSock.remoteAddress;
+  let headerBuf  = Buffer.alloc(0);
+  let headerDone = false;
 
-const wss = new WebSocket.Server({ noServer: true });
+  clientSock.on('data', (chunk) => {
+    if (headerDone) {
+      // Sudah masuk fase tunnel — pipe langsung ke SSH
+      sshSock.write(chunk);
+      return;
+    }
 
-httpServer.on('upgrade', (req, socket, head) => {
-  const clientIP = req.socket.remoteAddress;
-  const authHeader = req.headers['authorization'] || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    headerBuf = Buffer.concat([headerBuf, chunk]);
+    const headerEnd = headerBuf.indexOf('\r\n\r\n');
+    if (headerEnd === -1) return; // Header belum lengkap
 
-  if (!PROXY_TOKEN || token !== PROXY_TOKEN) {
-    console.warn(`[WS] Ditolak dari ${clientIP} — token tidak valid`);
-    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-    socket.destroy();
-    return;
-  }
+    // Header sudah lengkap
+    const headerStr = headerBuf.slice(0, headerEnd).toString();
+    const bodyPart  = headerBuf.slice(headerEnd + 4); // sisa setelah header
 
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-});
+    // Validasi Bearer token
+    const authMatch = headerStr.match(/Authorization:\s*Bearer\s+(\S+)/i);
+    const token     = authMatch ? authMatch[1] : '';
 
-wss.on('connection', (ws, req) => {
-  const clientIP = req.socket.remoteAddress;
-  console.log(`[WS] Koneksi dari ${clientIP} — teruskan ke SSH :${SSH_PORT}`);
+    if (PROXY_TOKEN && token !== PROXY_TOKEN) {
+      console.warn(`[Proxy] Token tidak valid dari ${ip}`);
+      clientSock.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      clientSock.destroy();
+      return;
+    }
 
-  const sshSocket = net.createConnection({ host: '127.0.0.1', port: SSH_PORT });
+    console.log(`[Proxy] Koneksi dari ${ip} — buka tunnel ke SSH`);
+    headerDone = true;
 
-  sshSocket.on('connect', () => console.log(`[WS] SSH socket terhubung`));
+    // Buka koneksi ke SSH
+    sshSock = net.createConnection({ host: '127.0.0.1', port: SSH_PORT });
 
-  // SSH → WS
-  sshSocket.on('data', (data) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    sshSock.on('connect', () => {
+      // Balas 200 OK agar HTTP Custom tahu tunnel siap
+      clientSock.write('HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n');
+      // Kirim sisa bytes yang sudah terbaca (jika ada)
+      if (bodyPart.length > 0) sshSock.write(bodyPart);
+    });
+
+    // SSH → client
+    sshSock.on('data', (d) => { if (!clientSock.destroyed) clientSock.write(d); });
+    sshSock.on('close', () => clientSock.destroy());
+    sshSock.on('error', (e) => {
+      console.error(`[Proxy] SSH socket error: ${e.message}`);
+      clientSock.destroy();
+    });
   });
 
-  // WS → SSH
-  ws.on('message', (data) => {
-    if (sshSocket.writable) sshSocket.write(Buffer.isBuffer(data) ? data : Buffer.from(data));
-  });
+  let sshSock; // referensi ke SSH socket (di-set setelah header terbaca)
 
-  ws.on('close', () => { console.log(`[WS] Ditutup dari ${clientIP}`); sshSocket.destroy(); });
-  ws.on('error', (e) => { console.error(`[WS] Error: ${e.message}`); sshSocket.destroy(); });
-  sshSocket.on('close', () => { if (ws.readyState === WebSocket.OPEN) ws.close(); });
-  sshSocket.on('error', (e) => { console.error(`[SSH Socket] Error: ${e.message}`); if (ws.readyState === WebSocket.OPEN) ws.close(); });
+  clientSock.on('close', () => { if (sshSock) sshSock.destroy(); });
+  clientSock.on('error', (e) => {
+    console.error(`[Proxy] Client error dari ${ip}: ${e.message}`);
+    if (sshSock) sshSock.destroy();
+  });
 });
 
-httpServer.listen(PROXY_PORT, '0.0.0.0', () => {
-  console.log(`[*] WebSocket Proxy berjalan di 0.0.0.0:${PROXY_PORT}`);
+proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {
+  console.log(`[*] Raw TCP Proxy  → 0.0.0.0:${PROXY_PORT}`);
 });
