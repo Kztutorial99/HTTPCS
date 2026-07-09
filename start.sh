@@ -8,14 +8,13 @@ echo "========================================"
 # ── 1. Generate credentials acak ────────────
 SSH_USER="admin"
 SSH_PASS=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 12)
-PROXY_TOKEN=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32)
 
-export SSH_USER SSH_PASS PROXY_TOKEN
+export SSH_USER SSH_PASS PROXY_TOKEN=""   # token tidak dipakai (bore = raw TCP)
 
 echo "[+] Credentials di-generate."
 
-# ── 2. Jalankan server.js (SSH + WS Proxy) ──
-echo "[*] Menjalankan SSH + WebSocket server..."
+# ── 2. Jalankan server.js (SSH server) ──────
+echo "[*] Menjalankan SSH server..."
 pkill -f "node server.js" 2>/dev/null || true
 sleep 1
 
@@ -28,65 +27,58 @@ if ! kill -0 $SERVER_PID 2>/dev/null; then
   exit 1
 fi
 
-# Health check port 2222 dan 8080
-for PORT in 2222 8080; do
-  for i in $(seq 1 10); do
-    nc -z 127.0.0.1 $PORT 2>/dev/null && break
-    [ $i -eq 10 ] && echo "[!] Port $PORT tidak merespons." && exit 1
-    sleep 1
-  done
-  echo "[+] Port $PORT siap."
+# Health check port 2222
+for i in $(seq 1 10); do
+  nc -z 127.0.0.1 2222 2>/dev/null && break
+  [ $i -eq 10 ] && echo "[!] Port 2222 tidak merespons." && exit 1
+  sleep 1
 done
+echo "[+] Port 2222 (SSH) siap."
 
-# ── 3. Cloudflare Quick Tunnel ───────────────
-echo "[*] Menghubungkan ke Cloudflare Quick Tunnel..."
-rm -f /tmp/cloudflared.log
-cloudflared tunnel --url http://localhost:8080 \
-  --no-autoupdate \
-  2>&1 | tee /tmp/cloudflared.log &
+# ── 3. Bore Tunnel (raw TCP) ─────────────────
+echo "[*] Membuka bore tunnel ke bore.pub..."
+rm -f /tmp/bore.log
+bore local 2222 --to bore.pub 2>&1 | tee /tmp/bore.log &
+BORE_PID=$!
 
-CF_PID=$!
-
-TUNNEL_URL=""
+# Tunggu bore port muncul (max 30 detik)
+BORE_PORT=""
 for i in $(seq 1 30); do
   sleep 1
-  TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -1)
-  [ -n "$TUNNEL_URL" ] && break
+  BORE_PORT=$(grep -oP 'listening at bore\.pub:\K[0-9]+' /tmp/bore.log 2>/dev/null | head -1)
+  [ -n "$BORE_PORT" ] && break
 done
 
-if [ -z "$TUNNEL_URL" ]; then
-  echo "[!] Tunnel URL tidak terdeteksi. Cek /tmp/cloudflared.log"
+if [ -z "$BORE_PORT" ]; then
+  echo "[!] bore port tidak terdeteksi. Log:"
+  cat /tmp/bore.log 2>/dev/null
   exit 1
 fi
-
-TUNNEL_DOMAIN=$(echo "$TUNNEL_URL" | sed 's|https://||')
 
 echo ""
 echo "========================================"
 echo "  ✅ SERVER SIAP!"
 echo "========================================"
 echo ""
-echo "  📡 Tunnel : $TUNNEL_URL"
+echo "  📡 Tunnel : bore.pub:$BORE_PORT"
 echo ""
 echo "════════════════════════════════════════"
-echo "  CONFIG HTTP CUSTOM"
+echo "  CONFIG HTTP CUSTOM (SSH LANGSUNG)"
 echo "════════════════════════════════════════"
 echo ""
-echo "  ┌─ Kolom SSH ──────────────────────────────────────────────────────"
-echo "  $TUNNEL_DOMAIN:443@$SSH_USER:$SSH_PASS"
-echo "  └──────────────────────────────────────────────────────────────────"
+echo "  ┌─ Kolom SSH ──────────────────────────"
+echo "  bore.pub:$BORE_PORT@$SSH_USER:$SSH_PASS"
+echo "  └──────────────────────────────────────"
 echo ""
-echo "  ┌─ Payload ────────────────────────────────────────────────────────"
-echo "  GET / HTTP/1.1[crlf]Host: $TUNNEL_DOMAIN[crlf]X-Token: $PROXY_TOKEN[crlf][crlf]"
-echo "  └──────────────────────────────────────────────────────────────────"
+echo "  ❌ Use Payload  → jangan centang"
+echo "  ❌ Enhanced     → jangan centang"
+echo "  ✅ Enable DNS"
+echo "  ❌ SlowDns / UDP Custom / SSL / Psiphon / V2ray"
 echo ""
-echo "  Checklist:"
-echo "  ✅ Use Payload  ✅ Enable DNS"
-echo "  ❌ UDP Custom (tdk bisa bareng Use Payload — pilih salah satu)"
-echo "  ❌ SSL  ❌ Enhanced  ❌ SlowDns  ❌ Psiphon  ❌ V2ray"
+echo "  (Koneksi langsung, tidak butuh payload!)"
 echo ""
-echo "  ⚠️  URL & password BERUBAH setiap restart!"
+echo "  ⚠️  Port & password BERUBAH setiap restart!"
 echo "========================================"
 echo ""
 echo "[*] Tekan Ctrl+C untuk stop."
-wait $CF_PID
+wait $BORE_PID
