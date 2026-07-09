@@ -118,9 +118,10 @@ const proxyServer = net.createServer((clientSock) => {
     const headerStr = headerBuf.slice(0, headerEnd).toString();
     const bodyPart  = headerBuf.slice(headerEnd + 4); // sisa setelah header
 
-    // Validasi Bearer token
-    const authMatch = headerStr.match(/Authorization:\s*Bearer\s+(\S+)/i);
-    const token     = authMatch ? authMatch[1] : '';
+    // Validasi token — cek header X-Token atau Authorization Bearer
+    const xToken    = (headerStr.match(/X-Token:\s*(\S+)/i)     || [])[1] || '';
+    const authMatch = (headerStr.match(/Authorization:\s*Bearer\s+(\S+)/i) || [])[1] || '';
+    const token     = xToken || authMatch;
 
     if (PROXY_TOKEN && token !== PROXY_TOKEN) {
       console.warn(`[Proxy] Token tidak valid dari ${ip}`);
