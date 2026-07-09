@@ -37,7 +37,33 @@ if (fs.existsSync(HOST_KEY_PATH)) {
 }
 
 // ── SSH Server ────────────────────────────────────────────────────────────────
-const sshServer = new SSHServer({ hostKeys: [hostKey] }, (client) => {
+const sshServer = new SSHServer({
+  hostKeys: [hostKey],
+  // Dukung algoritma lama agar kompatibel dengan ssh2js (HTTP Custom)
+  algorithms: {
+    kex: [
+      'curve25519-sha256', 'curve25519-sha256@libssh.org',
+      'ecdh-sha2-nistp256', 'ecdh-sha2-nistp384', 'ecdh-sha2-nistp521',
+      'diffie-hellman-group-exchange-sha256', 'diffie-hellman-group-exchange-sha1',
+      'diffie-hellman-group14-sha256', 'diffie-hellman-group14-sha1',
+      'diffie-hellman-group1-sha1',
+    ],
+    cipher: [
+      'aes128-ctr', 'aes192-ctr', 'aes256-ctr',
+      'aes128-cbc', 'aes192-cbc', 'aes256-cbc',
+      'aes128-gcm@openssh.com', 'aes256-gcm@openssh.com',
+      '3des-cbc',
+    ],
+    hmac: [
+      'hmac-sha2-256', 'hmac-sha2-512',
+      'hmac-sha1', 'hmac-sha1-96',
+      'hmac-md5', 'hmac-md5-96',
+      'hmac-sha2-256-etm@openssh.com', 'hmac-sha2-512-etm@openssh.com',
+    ],
+    compress: ['none', 'zlib@openssh.com', 'zlib'],
+    serverHostKey: ['rsa-sha2-512', 'rsa-sha2-256', 'ssh-rsa'],
+  },
+}, (client) => {
   const addr = client._sock?.remoteAddress || '?';
   console.log(`[SSH] Klien: ${addr}`);
 
