@@ -11,6 +11,7 @@
   "description": "",
   "dependencies": {
     "net": "^1.0.2",
+    "ssh2": "^1.17.0",
     "ws": "^8.21.0"
   }
 }
