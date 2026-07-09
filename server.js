@@ -1,11 +1,13 @@
 /**
- * HTTP Custom SSH Server
- * - SSH server (ssh2) port 2222 — password auth, no system user
- * - Raw TCP proxy port 8080:
- *     1. Terima HTTP payload dari HTTP Custom
- *     2. Validasi Bearer token
- *     3. Balas 200 OK
- *     4. Pipe raw TCP → SSH 2222
+ * HTTP Custom SSH Tunneling Server
+ *
+ * Mode Replit  : SSH 127.0.0.1:2222 → bore.pub tunnel
+ * Mode Railway : SSH 0.0.0.0:2222   → Railway TCP Proxy (domain statis)
+ *
+ * Fitur:
+ * - SSH server (ssh2) dengan password auth custom (no system users)
+ * - Direct TCP forwarding (tcpip) → forward traffic internet dari HP
+ * - Raw TCP proxy (port 8080) → untuk mode payload HTTP Custom
  */
 
 const net    = require('net');
@@ -14,12 +16,18 @@ const crypto = require('crypto');
 const { Server: SSHServer } = require('ssh2');
 const { spawn } = require('child_process');
 
-const SSH_PORT   = 2222;
-const PROXY_PORT = 8080;
+// ── Deteksi environment ───────────────────────────────────────────────────────
+const IS_RAILWAY = !!process.env.RAILWAY_ENVIRONMENT;
 
-const SSH_USER    = process.env.SSH_USER    || 'admin';
-const SSH_PASS    = process.env.SSH_PASS    || 'changeme';
+const SSH_PORT   = parseInt(process.env.SSH_PORT   || '2222', 10);
+const PROXY_PORT = parseInt(process.env.PROXY_PORT || '8080', 10);
+const SSH_BIND   = IS_RAILWAY ? '0.0.0.0' : '127.0.0.1';
+
+const SSH_USER    = process.env.SSH_USER || 'admin';
+const SSH_PASS    = process.env.SSH_PASS || 'changeme';
 const PROXY_TOKEN = process.env.PROXY_TOKEN || '';
+
+console.log(`[*] Mode           → ${IS_RAILWAY ? 'Railway' : 'Replit'}`);
 
 // ── Host key ──────────────────────────────────────────────────────────────────
 const HOST_KEY_PATH = '/tmp/ssh_host_key.pem';
@@ -39,7 +47,7 @@ if (fs.existsSync(HOST_KEY_PATH)) {
 // ── SSH Server ────────────────────────────────────────────────────────────────
 const sshServer = new SSHServer({
   hostKeys: [hostKey],
-  // Dukung algoritma lama agar kompatibel dengan ssh2js (HTTP Custom)
+  // Dukung algoritma lama (ssh2js yang dipakai HTTP Custom)
   algorithms: {
     kex: [
       'curve25519-sha256', 'curve25519-sha256@libssh.org',
@@ -65,7 +73,7 @@ const sshServer = new SSHServer({
   },
 }, (client) => {
   const addr = client._sock?.remoteAddress || '?';
-  console.log(`[SSH] Klien: ${addr}`);
+  console.log(`[SSH] Klien konek: ${addr}`);
 
   client.on('authentication', (ctx) => {
     if (ctx.method === 'password'
@@ -75,36 +83,34 @@ const sshServer = new SSHServer({
       return ctx.accept();
     }
     if (ctx.method === 'none') return ctx.reject(['password']);
-    console.warn(`[SSH] Auth GAGAL: ${ctx.username}/${ctx.method}`);
+    console.warn(`[SSH] Auth GAGAL: ${ctx.username} / method=${ctx.method}`);
     ctx.reject();
   });
 
   client.on('ready', () => {
 
-    // ── Direct TCP forwarding — ini yang buat internet jalan ──────────────
-    // Setiap request browser/app di HP diteruskan lewat sini ke internet.
+    // ── Direct TCP forwarding (SOCKS proxy / internet forwarding) ─────────
+    // Setiap request dari HP (browser, app) diteruskan ke internet via sini.
     client.on('tcpip', (accept, reject, info) => {
       const { destAddr, destPort } = info;
       console.log(`[FWD] → ${destAddr}:${destPort}`);
 
-      // Buka koneksi ke tujuan (google.com, dll)
       const dest = net.createConnection(destPort, destAddr);
 
       dest.on('error', (err) => {
-        console.warn(`[FWD] Gagal → ${destAddr}:${destPort} : ${err.message}`);
-        try { reject(); } catch(_) {}
+        console.warn(`[FWD] Error → ${destAddr}:${destPort} : ${err.message}`);
+        try { reject(); } catch (_) {}
       });
 
       dest.on('connect', () => {
         const stream = accept();
         if (!stream) { dest.destroy(); return; }
-        // Pipe dua arah: HP ↔ server ↔ internet
         stream.pipe(dest);
         dest.pipe(stream);
         stream.on('close', () => dest.destroy());
-        dest.on('close',   () => { try { stream.close(); } catch(_) {} });
+        dest.on('close',   () => { try { stream.close(); } catch (_) {} });
         stream.on('error', () => dest.destroy());
-        dest.on('error',   () => { try { stream.close(); } catch(_) {} });
+        dest.on('error',   () => { try { stream.close(); } catch (_) {} });
       });
     });
 
@@ -139,83 +145,60 @@ const sshServer = new SSHServer({
   client.on('end',   ()  => console.log(`[SSH] Disconnect: ${addr}`));
 });
 
-sshServer.listen(SSH_PORT, '127.0.0.1', () => {
-  console.log(`[*] SSH Server     → 127.0.0.1:${SSH_PORT}`);
+sshServer.listen(SSH_PORT, SSH_BIND, () => {
+  console.log(`[*] SSH Server     → ${SSH_BIND}:${SSH_PORT}`);
   console.log(`[*] Credentials    → ${SSH_USER} / ${SSH_PASS}`);
 });
 
-// ── Raw TCP Proxy ─────────────────────────────────────────────────────────────
-//
-// HTTP Custom mengirim payload HTTP, lalu langsung kirim traffic SSH di
-// koneksi yang sama. Kita cukup:
-//   1. Baca header HTTP
-//   2. Validasi Bearer token
-//   3. Balas 200 OK\r\n\r\n
-//   4. Pipe sisa bytes → SSH
-//
+// ── Raw TCP Proxy (port 8080) ─────────────────────────────────────────────────
+// Untuk mode payload HTTP Custom: terima HTTP payload → balas 200 OK → pipe SSH
 const proxyServer = net.createServer((clientSock) => {
   const ip = clientSock.remoteAddress;
   let headerBuf  = Buffer.alloc(0);
   let headerDone = false;
+  let sshSock;
 
   clientSock.on('data', (chunk) => {
     if (headerDone) {
-      // Sudah masuk fase tunnel — pipe langsung ke SSH
-      sshSock.write(chunk);
+      if (sshSock && !sshSock.destroyed) sshSock.write(chunk);
       return;
     }
 
     headerBuf = Buffer.concat([headerBuf, chunk]);
     const headerEnd = headerBuf.indexOf('\r\n\r\n');
-    if (headerEnd === -1) return; // Header belum lengkap
+    if (headerEnd === -1) return;
 
-    // Header sudah lengkap
     const headerStr = headerBuf.slice(0, headerEnd).toString();
-    const bodyPart  = headerBuf.slice(headerEnd + 4); // sisa setelah header
+    const bodyPart  = headerBuf.slice(headerEnd + 4);
 
-    // Validasi token — cek header X-Token atau Authorization Bearer
-    const xToken    = (headerStr.match(/X-Token:\s*(\S+)/i)     || [])[1] || '';
+    const xToken    = (headerStr.match(/X-Token:\s*(\S+)/i)              || [])[1] || '';
     const authMatch = (headerStr.match(/Authorization:\s*Bearer\s+(\S+)/i) || [])[1] || '';
     const token     = xToken || authMatch;
 
     if (PROXY_TOKEN && token !== PROXY_TOKEN) {
-      console.warn(`[Proxy] Token tidak valid dari ${ip}`);
+      console.warn(`[Proxy] Token invalid dari ${ip}`);
       clientSock.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
       clientSock.destroy();
       return;
     }
 
-    console.log(`[Proxy] Koneksi dari ${ip} — buka tunnel ke SSH`);
     headerDone = true;
+    console.log(`[Proxy] Koneksi dari ${ip} → SSH`);
 
-    // Buka koneksi ke SSH
     sshSock = net.createConnection({ host: '127.0.0.1', port: SSH_PORT });
-
     sshSock.on('connect', () => {
-      // Balas 200 OK agar HTTP Custom tahu tunnel siap
       clientSock.write('HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n');
-      // Kirim sisa bytes yang sudah terbaca (jika ada)
       if (bodyPart.length > 0) sshSock.write(bodyPart);
     });
-
-    // SSH → client
-    sshSock.on('data', (d) => { if (!clientSock.destroyed) clientSock.write(d); });
-    sshSock.on('close', () => clientSock.destroy());
-    sshSock.on('error', (e) => {
-      console.error(`[Proxy] SSH socket error: ${e.message}`);
-      clientSock.destroy();
-    });
+    sshSock.on('data',  (d) => { if (!clientSock.destroyed) clientSock.write(d); });
+    sshSock.on('close', ()  => clientSock.destroy());
+    sshSock.on('error', (e) => { console.error(`[Proxy] SSH err: ${e.message}`); clientSock.destroy(); });
   });
-
-  let sshSock; // referensi ke SSH socket (di-set setelah header terbaca)
 
   clientSock.on('close', () => { if (sshSock) sshSock.destroy(); });
-  clientSock.on('error', (e) => {
-    console.error(`[Proxy] Client error dari ${ip}: ${e.message}`);
-    if (sshSock) sshSock.destroy();
-  });
+  clientSock.on('error', (e) => { console.error(`[Proxy] Client err ${ip}: ${e.message}`); if (sshSock) sshSock.destroy(); });
 });
 
 proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {
-  console.log(`[*] Raw TCP Proxy  → 0.0.0.0:${PROXY_PORT}`);
+  console.log(`[*] TCP Proxy      → 0.0.0.0:${PROXY_PORT}`);
 });

@@ -1,0 +1,10 @@
+node_modules/
+.cache/
+.upm/
+.local/
+.agents/
+attached_assets/
+/tmp/
+*.log
+*.pem
+.env
