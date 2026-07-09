@@ -80,6 +80,35 @@ const sshServer = new SSHServer({
   });
 
   client.on('ready', () => {
+
+    // ── Direct TCP forwarding — ini yang buat internet jalan ──────────────
+    // Setiap request browser/app di HP diteruskan lewat sini ke internet.
+    client.on('tcpip', (accept, reject, info) => {
+      const { destAddr, destPort } = info;
+      console.log(`[FWD] → ${destAddr}:${destPort}`);
+
+      // Buka koneksi ke tujuan (google.com, dll)
+      const dest = net.createConnection(destPort, destAddr);
+
+      dest.on('error', (err) => {
+        console.warn(`[FWD] Gagal → ${destAddr}:${destPort} : ${err.message}`);
+        try { reject(); } catch(_) {}
+      });
+
+      dest.on('connect', () => {
+        const stream = accept();
+        if (!stream) { dest.destroy(); return; }
+        // Pipe dua arah: HP ↔ server ↔ internet
+        stream.pipe(dest);
+        dest.pipe(stream);
+        stream.on('close', () => dest.destroy());
+        dest.on('close',   () => { try { stream.close(); } catch(_) {} });
+        stream.on('error', () => dest.destroy());
+        dest.on('error',   () => { try { stream.close(); } catch(_) {} });
+      });
+    });
+
+    // ── Shell session ─────────────────────────────────────────────────────
     client.on('session', (accept) => {
       const session = accept();
       session.on('pty', (accept) => accept && accept());
